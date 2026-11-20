@@ -3,8 +3,14 @@
 # Optional: OPENAI_API_KEY=sk-... docker compose -f docker-compose.local.yml up -d --build
 services:
   postgres:
-    image: postgres:17-alpine
+    # Debian image + self-signed cert, because the main backend always connects with SSL (AWS RDS style)
+    image: postgres:17
     container_name: botivate-chatbot-localdb
+    command: >
+      sh -c "mkdir -p /certs && cd /certs &&
+      (test -f server.key || openssl req -new -x509 -days 3650 -nodes -subj /CN=localhost -out server.crt -keyout server.key) &&
+      chown postgres:postgres server.* && chmod 600 server.key &&
+      exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key"
     environment:
       POSTGRES_PASSWORD: test
       POSTGRES_DB: rama_local
