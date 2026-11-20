@@ -18,7 +18,7 @@ const readOnlyPool = new Pool({
     password: process.env.DB_PASSWORD?.trim(),
     database: process.env.DB_NAME?.trim(),
     port: parseInt(process.env.DB_PORT?.trim() || "5432"),
-    ssl: { rejectUnauthorized: false },
+    ssl: process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false },
     max: 5,
     options: "-c default_transaction_read_only=on -c statement_timeout=20000"
 });

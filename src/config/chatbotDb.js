@@ -13,7 +13,7 @@ const pool = new Pool({
     password: process.env.DB_PASSWORD?.trim(),
     database: process.env.DB_NAME?.trim(),
     port: parseInt(process.env.DB_PORT?.trim() || "5432"),
-    ssl: { rejectUnauthorized: false }, // required for AWS RDS
+    ssl: process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false }, // SSL required for AWS RDS; set DB_SSL=false only for a local DB
     max: 10
 });
 
