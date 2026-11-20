@@ -17,7 +17,14 @@ import {
     getAdminWorkReportsByDateRangeController
 } from "../controllers/chatbotController.js";
 
+import {
+    getOpenAIKeyStatus,
+    setOpenAIKey,
+    removeOpenAIKey
+} from "../controllers/chatbotSettingsController.js";
+
 import chatbotAdminMiddleware from "../middleware/chatbotAdminMiddleware.js";
+import superAdminMiddleware from "../middleware/superAdminMiddleware.js";
 
 const router = express.Router();
 
@@ -92,6 +99,16 @@ router.get(
     chatbotAdminMiddleware,
     getAdminWorkReportsByDateRangeController
 );
+
+
+// ==========================================
+// Super admin only: AI settings (OpenAI key)
+// The key is never returned, only its masked form.
+// ==========================================
+
+router.get("/settings/openai-key", superAdminMiddleware, getOpenAIKeyStatus);
+router.put("/settings/openai-key", superAdminMiddleware, setOpenAIKey);
+router.delete("/settings/openai-key", superAdminMiddleware, removeOpenAIKey);
 
 
 export default router;

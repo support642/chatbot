@@ -34,15 +34,28 @@ shared `sessions` table). The user must be active and have role `admin`, `div_ad
 | POST | `/confirm-work-report` | Confirm a drafted work report |
 | POST | `/admin/export` | Full data behind an answer (PDF/Excel) |
 | GET | `/my-tasks`, `/my-work-history` | Employee data |
+| GET / PUT / DELETE | `/settings/openai-key` | **super_admin only.** Status (masked) / save / remove the OpenAI key |
 | GET | `/admin/dashboard-summary`, `/task-analytics`, `/department-analytics`, `/employee-analytics`, `/work-reports`, `/work-reports/date-range` | Admin analytics |
 
 `GET /health` (no auth) returns `{"status":"ok"}` when the DB is reachable, otherwise 503.
 
 ## Environment variables
 
-See `.env.example`. Required: `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `OPENAI_API_KEY`.
-Optional: `PORT` (4001), `DB_PORT` (5432), `OPENAI_MODEL` (gpt-4o), `CORS_ORIGINS`.
-The service refuses to start if `OPENAI_API_KEY` is missing.
+See `.env.example`. Required: `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `SETTINGS_ENCRYPTION_KEY`.
+Optional: `PORT` (4001), `DB_PORT` (5432), `DB_SSL` (set `false` only for a local DB), `OPENAI_MODEL` (gpt-4o),
+`CORS_ORIGINS`, `OPENAI_API_KEY` (fallback only).
+
+## OpenAI key (managed from the frontend)
+
+A **super admin** adds the OpenAI key in the app: Settings -> **AI Key** tab.
+
+- The key is checked against OpenAI, then stored **AES-256-GCM encrypted** in `chatbot_settings`.
+  The master key is `SETTINGS_ENCRYPTION_KEY` (server env only, never in the DB). Generate: `openssl rand -hex 32`.
+- After saving it can never be viewed again: the API only returns `sk-••••••••••••<last4>`.
+- The AI picks up a new key within seconds, no restart. Key order: database first, `OPENAI_API_KEY` env as fallback.
+- If `SETTINGS_ENCRYPTION_KEY` is lost or changed, the stored key cannot be decrypted (the service falls back to
+  `OPENAI_API_KEY` if set) and must be entered again. Back it up.
+- With no key at all, `/chat` returns 503 "The AI assistant is not set up yet".
 
 ## Database
 

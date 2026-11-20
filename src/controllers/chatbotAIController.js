@@ -158,6 +158,13 @@ export const handleChatMessage = async (req, res) => {
     } catch (error) {
         console.error("Chat API Error:", error);
 
+        if (error.code === "NO_OPENAI_KEY") {
+            return res.status(503).json({
+                success: false,
+                message: "The AI assistant is not set up yet. A super admin must add the OpenAI key in Settings."
+            });
+        }
+
         return res.status(500).json({
             success: false,
             message: "Unable to process your message."

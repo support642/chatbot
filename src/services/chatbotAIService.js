@@ -15,6 +15,7 @@ import {
     ADMIN_ROLES,
     getRequesterProfile
 } from "./chatbotDataService.js";
+import { getActiveOpenAIKey } from "./chatbotSettingsService.js";
 
 dotenv.config();
 dotenv.config({
@@ -25,22 +26,40 @@ dotenv.config({
 // AI PROVIDER: OpenAI
 // =====================================================
 
-const openaiKey = process.env.OPENAI_API_KEY?.trim();
 const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o";
 
-if (!openaiKey) {
-    throw new Error("OPENAI_API_KEY is missing. Please set it in .env or .env.local");
-}
+// The API key is set by a super admin from the frontend (stored encrypted in the DB),
+// with OPENAI_API_KEY from .env as fallback. The client is rebuilt whenever it changes,
+// so a new key takes effect without restarting the service.
+let aiClient = null;
+let aiClientKey = null;
 
-const aiClient = new OpenAI({ apiKey: openaiKey });
+const getAiClient = async () => {
+    const key = await getActiveOpenAIKey();
+
+    if (!key) {
+        const err = new Error("OpenAI API key is not configured.");
+        err.code = "NO_OPENAI_KEY";
+        throw err;
+    }
+
+    if (key !== aiClientKey) {
+        aiClient = new OpenAI({ apiKey: key });
+        aiClientKey = key;
+    }
+
+    return aiClient;
+};
 
 console.log(`Chatbot AI provider: OpenAI (model: ${model})`);
 
 // Reasoning models (o1/o3/o4, gpt-5...) reject a custom temperature.
 const supportsTemperature = !/^(o\d|gpt-5)/i.test(model);
 
-const createChatCompletion = ({ messages, tools, temperature, maxTokens }) =>
-    aiClient.chat.completions.create({
+const createChatCompletion = async ({ messages, tools, temperature, maxTokens }) => {
+    const client = await getAiClient();
+
+    return client.chat.completions.create({
         model,
         messages,
         tools,
@@ -48,6 +67,7 @@ const createChatCompletion = ({ messages, tools, temperature, maxTokens }) =>
         ...(supportsTemperature ? { temperature } : {}),
         max_completion_tokens: maxTokens
     });
+};
 
 // Keeps the assistant strictly on-topic (applies to every role).
 const SCOPE_RULES = `
@@ -1030,6 +1050,11 @@ export const generateAIResponse = async (messages, username, { previousExport = 
 
     } catch (error) {
         console.error("Chatbot AI Service Error:", error);
+
+        // Let the controller show a clear "key not set up" message
+        if (error.code === "NO_OPENAI_KEY") {
+            throw error;
+        }
 
         throw new Error("Unable to generate an AI response.");
     }
