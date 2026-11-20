@@ -1,0 +1,19 @@
+{
+  "name": "chatbot-service",
+  "version": "1.0.0",
+  "description": "Botivate AI chatbot service (admin assistant) - standalone, Dockerized",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test-session": "node src/scripts/createTestSession.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "openai": "^4.104.0",
+    "pg": "^8.16.3"
+  }
+}
