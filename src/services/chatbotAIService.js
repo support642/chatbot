@@ -204,6 +204,12 @@ Rules:
 
 const buildAdminSystemPrompt = (profile) => {
     const today = getISTDate();
+    const [year, month] = today.split("-").map(Number);
+    const nextMonthYear = month === 12 ? year + 1 : year;
+    const nextMonth = month === 12 ? 1 : month + 1;
+    const nextMonthStart = `${nextMonthYear}-${String(nextMonth).padStart(2, "0")}-01`;
+    // Day 0 of the following month = last day of next month (handles leap years).
+    const nextMonthEnd = new Date(Date.UTC(nextMonthYear, nextMonth, 0)).toISOString().slice(0, 10);
 
     return `
 You are the AI data assistant for the Rama Checklist & Delegation system.
@@ -213,6 +219,8 @@ Today's date (IST) is ${today}. Yesterday was ${subtractDays(today, 1)}.
 "Last 7 days / past week / pichle hafte" = ${subtractDays(today, 6)} to ${today}.
 "Last 30 days / pichle mahine" = ${subtractDays(today, 29)} to ${today}.
 "This month / is mahine" = ${today.slice(0, 8)}01 to ${today}.
+"Next month / agle mahine / अगले महीने" = ${nextMonthStart} to ${nextMonthEnd}.
+"Next year / agle saal / अगले साल" = ${year + 1}-01-01 to ${year + 1}-12-31.
 "Today / aaj / 1 din" = ${today} to ${today}.
 
 You have READ-ONLY access to task data (checklist, delegation, maintenance),
@@ -224,7 +232,10 @@ Rules:
    invent counts, names or tasks. Only report what tools return.
 2. Pick the right tool:
    - Counts / totals / completion % / on-time count and on-time % -> get_task_summary
-     (on_time_rate_percent is the dashboard "On Time" %; it is on_time / completed)
+     (on_time_rate_percent is the dashboard "On Time" %; it is on_time / completed.
+     For maintenance the dashboard shows On Time as 0 due to a dashboard rule issue;
+     if the user compares maintenance on-time with the dashboard, explain that the
+     chatbot counts maintenance tasks submitted on or before their planned date.)
    - Ranking or per-employee comparison -> get_employee_wise_summary
    - Show actual task names/details (planned date, delay, remarks, approval,
      on time or late, times extended) -> list_tasks
@@ -235,7 +246,8 @@ Rules:
    "October", "last 3 months") must be passed as start_date / end_date in YYYY-MM-DD.
    If the user gives a day / month WITHOUT a year, use the current year
    ${today.slice(0, 4)} (use ${Number(today.slice(0, 4)) - 1} only if that date would be after today).
-   Never use any other year unless the user typed it.
+   Never use any other year unless the user typed it, or asked for last / next
+   year or a future period that falls in the next year (e.g. next month in December).
    A range can be at most 366 days; if the user asks for more, say so and offer
    to split it.
 3. Dates: "today / aaj / आज / 1 din" means start_date = end_date = ${today}.
@@ -273,10 +285,20 @@ Rules:
 const MAX_TOOL_ROUNDS = 6;
 
 
+// "next year / agle saal / अगले साल"
+const NEXT_YEAR_PATTERN =
+    /\b(next|coming)\s+year\b|\b(agle|agla|agli)\s+(saal|sal|varsh|year)\b|(अगले|अगला)\s*(साल|वर्ष)/i;
+
+// Any future period: "next month", "next week", "next 7 days", "agle mahine",
+// "aane wale 10 din", "अगले महीने", "अगले साल" ...
+const FUTURE_PERIOD_PATTERN =
+    /\b(next|coming|upcoming)\s+(\d+\s+)?(days?|weeks?|months?|quarters?|years?)\b|\b(agle|agla|agli|aane\s+wale|aane\s+wala)\s+(\d+\s+)?(din|dino|dinon|hafte|hafta|week|weeks|mahine|mahina|month|months|saal|sal|varsh|year)\b|(अगले|अगला|अगली|आने\s*वाले)\s*(\d+\s*)?(दिन|दिनों|हफ्ते|हफ़्ते|सप्ताह|महीने|महीना|माह|साल|वर्ष)/i;
+
 // The model sometimes fills a missing year with one from its training data
 // (e.g. "1 nov se 15 nov" -> 2023-11-01). If a tool date uses a year the user
 // never typed, move the range to the current year (or the previous year when
-// that would put the start date in the future).
+// that would put the start date in the future; or the next year when the user
+// asked for "next year", or for a future period that would otherwise be in the past).
 const fixUnmentionedYears = (args, messages) => {
     if (!args || (!args.start_date && !args.end_date && !args.date)) {
         return args;
@@ -295,6 +317,17 @@ const fixUnmentionedYears = (args, messages) => {
     if (/\b(last|previous|past)\s+year\b|\b(pichle|pichhle|pichla|pichhla)\s+(saal|sal|varsh)\b|पिछले\s*साल|पिछला\s*साल/i.test(userText)) {
         mentionedYears.add(String(Number(currentYear) - 1));
     }
+
+    // "next month / agle saal / अगले महीने ..." can legitimately point to the next
+    // year (e.g. next month asked in December), so that year is allowed too.
+    // The latest message decides the direction when a stale year must be corrected.
+    const latestUserText = messages.filter((m) => m.role === "user").at(-1)?.content || "";
+    if (FUTURE_PERIOD_PATTERN.test(userText)) {
+        mentionedYears.add(String(Number(currentYear) + 1));
+    }
+    const asksNextYear = NEXT_YEAR_PATTERN.test(latestUserText);
+    const asksFuture = asksNextYear || FUTURE_PERIOD_PATTERN.test(latestUserText);
+
     const keys = ["start_date", "end_date", "date"].filter(
         (k) => typeof args[k] === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args[k])
     );
@@ -314,7 +347,15 @@ const fixUnmentionedYears = (args, messages) => {
 
     let target = Number(currentYear);
     const startKey = args.start_date ? "start_date" : keys[0];
-    if (shift(args[startKey], target) > today) target -= 1;
+    const endKey = args.end_date ? "end_date" : startKey;
+    if (asksNextYear) {
+        target += 1;
+    } else if (asksFuture) {
+        // A future period must not be moved into the past.
+        if (shift(args[endKey], target) < today) target += 1;
+    } else if (shift(args[startKey], target) > today) {
+        target -= 1;
+    }
 
     const fixed = { ...args };
     for (const k of keys) fixed[k] = shift(args[k], target);
