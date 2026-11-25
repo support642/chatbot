@@ -103,6 +103,15 @@ const dateRangeProps = {
     }
 };
 
+// Only on count / summary tools (cheap over long periods).
+const allTimeProp = {
+    all_time: {
+        type: "boolean",
+        description:
+            "true for 'all time / shuru se ab tak / ab tak total / overall since the beginning'. Ignores start_date and end_date."
+    }
+};
+
 const taskTypeProp = {
     task_type: {
         type: "string",
@@ -138,6 +147,7 @@ export const adminTools = [
                 properties: {
                     ...taskTypeProp,
                     ...dateRangeProps,
+                    ...allTimeProp,
                     employee_name: {
                         type: "string",
                         description: "Optional employee name (full or partial)."
@@ -160,6 +170,7 @@ export const adminTools = [
                 properties: {
                     ...taskTypeProp,
                     ...dateRangeProps,
+                    ...allTimeProp,
                     ...orgFilterProps,
                     sort_by: {
                         type: "string",
@@ -258,6 +269,7 @@ export const adminTools = [
                 type: "object",
                 properties: {
                     ...dateRangeProps,
+                    ...allTimeProp,
                     employee_name: {
                         type: "string",
                         description: "Optional employee name (full or partial)."
@@ -288,6 +300,7 @@ export const adminTools = [
                 type: "object",
                 properties: {
                     ...dateRangeProps,
+                    ...allTimeProp,
                     employee_name: {
                         type: "string",
                         description: "Optional employee name (full or partial)."
@@ -301,6 +314,121 @@ export const adminTools = [
                     limit: {
                         type: "integer",
                         description: "Max reports to return (1-50). Default 20."
+                    }
+                },
+                required: [],
+                additionalProperties: false
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_system_overview",
+            description:
+                "One-shot overview of the whole system within the user's access: how many people (active / inactive / on leave), how many employees, admins, division admins and super admins, how many units / divisions / departments, how many machines (equipment register, machine parts, machines with maintenance tasks), repair tasks, and all-time task totals per type (checklist / delegation / maintenance) with completion and on-time %. Use for 'kitna aadmi hai', 'kitne admin hain', 'kitne department hain', 'kitni machine hain', 'system ke baare mein batao', 'overall status', 'total kitne tasks bane ab tak'.",
+            parameters: {
+                type: "object",
+                properties: {},
+                required: [],
+                additionalProperties: false
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "list_employees_without_tasks",
+            description:
+                "Active people who have NO task (checklist / delegation / maintenance) assigned in a period, with a department-wise count and each person's last task date ('never' = no task ever). Use for 'kitne aadmi ka task bana hi nahi', 'kiska koi task nahi hai', 'idle employees', 'jinko kaam assign nahi hua'.",
+            parameters: {
+                type: "object",
+                properties: {
+                    ...taskTypeProp,
+                    ...dateRangeProps,
+                    ...allTimeProp,
+                    department: orgFilterProps.department,
+                    role: {
+                        type: "string",
+                        enum: ["user", "admins", "all"],
+                        description: "Whose accounts to check. Default 'user' (regular employees). 'admins' = admin / div_admin / super_admin."
+                    },
+                    limit: {
+                        type: "integer",
+                        description: "Max people to list (1-50). Default 50. Counts always cover everyone."
+                    }
+                },
+                required: [],
+                additionalProperties: false
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_department_wise_summary",
+            description:
+                "Task performance PER DEPARTMENT, ranked (default: worst on-time % first), with the overall figures for comparison: total, completed, pending, overdue, on time, late, completion % and on-time %. Use for 'kahan improve karne ki zarurat hai', 'kaunsa department peeche hai', 'best / worst department', 'department wise performance'.",
+            parameters: {
+                type: "object",
+                properties: {
+                    ...taskTypeProp,
+                    ...dateRangeProps,
+                    ...allTimeProp,
+                    unit: orgFilterProps.unit,
+                    division: orgFilterProps.division,
+                    sort_by: {
+                        type: "string",
+                        enum: ["on_time_rate", "completion_rate", "overdue", "pending", "late", "not_done", "total"],
+                        description: "Ranking metric. Default 'on_time_rate'."
+                    },
+                    order: {
+                        type: "string",
+                        enum: ["worst_first", "best_first"],
+                        description: "Default 'worst_first' (needs improvement first)."
+                    },
+                    min_tasks: {
+                        type: "integer",
+                        description: "Ignore departments with fewer tasks than this in the period. Default 5."
+                    }
+                },
+                required: [],
+                additionalProperties: false
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_machine_summary",
+            description:
+                "Machines: equipment register count (by status and department), machine parts registered, and maintenance performance PER MACHINE in a period (total, completed, pending, overdue, on time, late, last maintenance done, repairs), ranked; plus repair tasks by status. Use for 'kitni machine hain', 'kis machine ka maintenance pending hai', 'sabse zyada overdue kis machine par', 'machine repair status'.",
+            parameters: {
+                type: "object",
+                properties: {
+                    ...dateRangeProps,
+                    ...allTimeProp,
+                    machine_name: {
+                        type: "string",
+                        description: "Optional machine name (full or partial)."
+                    },
+                    department: {
+                        type: "string",
+                        description: "Optional machine department (e.g. 'Mechanical')."
+                    },
+                    sort_by: {
+                        type: "string",
+                        enum: ["overdue", "pending", "late", "total", "on_time_rate", "completion_rate", "repairs"],
+                        description: "Ranking metric for machines. Default 'overdue'."
+                    },
+                    order: {
+                        type: "string",
+                        enum: ["worst_first", "best_first"],
+                        description: "Default 'worst_first'."
+                    },
+                    limit: {
+                        type: "integer",
+                        description: "Machines to list (1-50). Default 15."
                     }
                 },
                 required: [],

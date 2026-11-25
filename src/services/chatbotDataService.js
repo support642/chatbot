@@ -212,10 +212,18 @@ const isValidDate = (date) => {
 const daysBetween = (a, b) =>
     Math.round((new Date(`${b}T00:00:00Z`) - new Date(`${a}T00:00:00Z`)) / 86400000);
 
-const resolveDateRange = (args = {}) => {
+// Earliest date used for "all time / shuru se ab tak" questions.
+const ALL_TIME_START = "2000-01-01";
+
+const isAllTime = (args = {}) => args.all_time === true || args.all_time === "true";
+
+// `maxDays` is relaxed (Infinity) for count-only tools, which stay cheap over
+// long ranges; row-listing tools keep the 366-day limit.
+const resolveDateRange = (args = {}, { maxDays = MAX_RANGE_DAYS } = {}) => {
     const today = getISTToday();
-    const startDate = args.start_date || `${today.slice(0, 8)}01`;
-    const endDate = args.end_date || today;
+    const allTime = isAllTime(args);
+    const startDate = allTime ? ALL_TIME_START : (args.start_date || `${today.slice(0, 8)}01`);
+    const endDate = allTime ? today : (args.end_date || today);
 
     if (!isValidDate(startDate) || !isValidDate(endDate)) {
         throw new Error("Invalid date. Use YYYY-MM-DD format.");
@@ -223,11 +231,14 @@ const resolveDateRange = (args = {}) => {
     if (startDate > endDate) {
         throw new Error("start_date cannot be after end_date.");
     }
-    if (daysBetween(startDate, endDate) > MAX_RANGE_DAYS) {
-        throw new Error(`Date range cannot be longer than ${MAX_RANGE_DAYS} days.`);
+    if (daysBetween(startDate, endDate) > maxDays) {
+        throw new Error(
+            `Date range cannot be longer than ${maxDays} days for a task list. ` +
+            "Use a summary tool (counts) for longer periods or all time."
+        );
     }
 
-    return { startDate, endDate, today };
+    return { startDate, endDate, today, allTime };
 };
 
 const pickEnum = (value, allowed, fallback, label) => {
@@ -557,9 +568,9 @@ const withRate = (row) => ({
     on_time_rate_percent: pct(row.on_time, row.completed)
 });
 
-const readCommonFilters = async (args, profile) => {
+const readCommonFilters = async (args, profile, { maxDays = MAX_RANGE_DAYS } = {}) => {
     const taskType = pickEnum(args.task_type, TASK_TYPES, "all", "task_type");
-    const { startDate, endDate, today } = resolveDateRange(args);
+    const { startDate, endDate, today, allTime } = resolveDateRange(args, { maxDays });
 
     let employee = null;
     if (args.employee_name) {
@@ -577,6 +588,7 @@ const readCommonFilters = async (args, profile) => {
             startDate,
             endDate,
             today,
+            allTime,
             employee,
             department: dept.department,
             unit: profile.role === "super_admin" ? cleanText(args.unit) : null,
@@ -587,6 +599,7 @@ const readCommonFilters = async (args, profile) => {
 
 const describeFilters = (f) => ({
     task_type: f.taskType,
+    ...(f.allTime ? { all_time: true } : {}),
     start_date: f.startDate,
     end_date: f.endDate,
     today: f.today,
@@ -603,7 +616,7 @@ const describeFilters = (f) => ({
 
 export const getTaskSummary = async (args, profile) => {
     assertAdmin(profile);
-    const { filters, failure } = await readCommonFilters(args, profile);
+    const { filters, failure } = await readCommonFilters(args, profile, { maxDays: Infinity });
     if (failure) return failure;
 
     const { cte, params, add } = buildTasksCte(profile, filters);
@@ -645,7 +658,11 @@ export const getTaskSummary = async (args, profile) => {
 
 export const getEmployeeWiseSummary = async (args, profile, { maxLimit = MAX_EMPLOYEE_ROWS } = {}) => {
     assertAdmin(profile);
-    const { filters, failure } = await readCommonFilters({ ...args, employee_name: null }, profile);
+    const { filters, failure } = await readCommonFilters(
+        { ...args, employee_name: null },
+        profile,
+        { maxDays: Infinity }
+    );
     if (failure) return failure;
 
     const sortBy = pickEnum(args.sort_by, SORT_FIELDS, "pending", "sort_by");
@@ -934,7 +951,7 @@ const EXTENDED_STATUS = ["all", "pending", "completed"];
 
 export const listExtendedDelegations = async (args, profile, { maxLimit = MAX_LIST_LIMIT } = {}) => {
     assertAdmin(profile);
-    const { startDate, endDate, today } = resolveDateRange(args);
+    const { startDate, endDate, today } = resolveDateRange(args, { maxDays: Infinity });
     const status = pickEnum(args.status, EXTENDED_STATUS, "all", "status");
     const limit = clampLimit(args.limit, 20, maxLimit);
 
@@ -1025,7 +1042,7 @@ const WORK_REPORT_STATUS = ["all", "completed", "in progress", "pending"];
 
 export const getWorkReports = async (args, profile, { maxLimit = MAX_LIST_LIMIT } = {}) => {
     assertAdmin(profile);
-    const { startDate, endDate } = resolveDateRange(args);
+    const { startDate, endDate } = resolveDateRange(args, { maxDays: Infinity });
     const status = pickEnum(args.status, WORK_REPORT_STATUS, "all", "status");
     const limit = clampLimit(args.limit, 20, maxLimit);
 
@@ -1089,5 +1106,531 @@ export const getWorkReports = async (args, profile, { maxLimit = MAX_LIST_LIMIT 
         summary: summary.rows[0],
         showing: list.rows.length,
         reports: list.rows.map(compactRow)
+    };
+};
+
+
+// =====================================================================
+// Shared helpers for the organisation / machine tools below
+// =====================================================================
+
+const whereSql = (clauses) => (clauses.length ? `WHERE ${clauses.join(" AND ")}` : "");
+
+// Equipment / repair tables have machine_division + machine_department (no unit).
+const buildMachineScope = (profile, params, alias) => {
+    const clauses = [];
+
+    if (profile.role === "div_admin" || profile.role === "admin") {
+        params.push(profile.division || "");
+        clauses.push(`LOWER(TRIM(${alias}.machine_division)) = LOWER(TRIM($${params.length}))`);
+    }
+
+    if (profile.role === "admin") {
+        const departments = String(profile.department || "")
+            .split(",")
+            .map((d) => d.trim().toLowerCase())
+            .filter(Boolean);
+        params.push(departments);
+        clauses.push(`LOWER(TRIM(${alias}.machine_department)) = ANY($${params.length})`);
+    }
+
+    return clauses;
+};
+
+// "Higher is better" per sortable metric; used to put the worst rows first.
+const HIGHER_IS_BETTER = {
+    on_time_rate: true,
+    completion_rate: true,
+    total: true,
+    completed: true,
+    on_time: true,
+    overdue: false,
+    pending: false,
+    late: false,
+    not_done: false,
+    repairs: false
+};
+
+const metricValue = (row, metric) =>
+    metric === "on_time_rate"
+        ? row.on_time_rate_percent
+        : metric === "completion_rate"
+            ? row.completion_rate_percent
+            : Number(row[metric] || 0);
+
+const sortRows = (rows, metric, order) => {
+    const better = HIGHER_IS_BETTER[metric] !== false;
+    const worstFirst = order !== "best_first";
+    // worst_first: ascending "goodness"; best_first: descending.
+    const sign = (better ? 1 : -1) * (worstFirst ? 1 : -1);
+    return [...rows].sort((a, b) => sign * (metricValue(a, metric) - metricValue(b, metric)));
+};
+
+const sumCounts = (rows) => {
+    const keys = ["total", "completed", "pending", "overdue", "due_today", "not_done", "on_time", "late", "extended"];
+    const total = Object.fromEntries(keys.map((k) => [k, 0]));
+    for (const r of rows) for (const k of keys) total[k] += Number(r[k] || 0);
+    return withRate(total);
+};
+
+const ROLE_FILTER_SQL = {
+    user: "LOWER(COALESCE(u.role::text, '')) = 'user'",
+    admins: "LOWER(COALESCE(u.role::text, '')) IN ('admin', 'div_admin', 'super_admin')",
+    all: "TRUE"
+};
+
+
+// =====================================================================
+// TOOL 8: System overview (people, roles, departments, machines, totals)
+// =====================================================================
+
+export const getSystemOverview = async (args, profile) => {
+    assertAdmin(profile);
+
+    const uParams = [];
+    const uScope = buildScope(profile, uParams, "u");
+    const uWhere = ["TRIM(COALESCE(u.user_name, '')) <> ''", ...uScope].join(" AND ");
+
+    const eParams = [];
+    const eWhere = whereSql(buildMachineScope(profile, eParams, "e"));
+    const pParams = [];
+    const pWhere = whereSql(buildMachineScope(profile, pParams, "p"));
+    const rParams = [];
+    const rWhere = whereSql(buildMachineScope(profile, rParams, "r"));
+
+    const mParams = [];
+    const mWhere = whereSql([
+        "TRIM(COALESCE(t.machine_name, '')) <> ''",
+        ...buildScope(profile, mParams, "t")
+    ]);
+    const dParams = [];
+    const dWhere = whereSql(["dd.status::text = 'extend'", ...buildScope(profile, dParams, "d")]);
+    const wParams = [];
+    const wWhere = whereSql(buildScope(profile, wParams, "w"));
+
+    const [people, departments, equipment, parts, maintMachines, repairs, extended, workReports, tasks] =
+        await Promise.all([
+            pool.query(
+                `SELECT
+                    COUNT(*)::int AS total_people,
+                    COUNT(*) FILTER (WHERE u.status::text = 'active')::int AS active,
+                    COUNT(*) FILTER (WHERE u.status::text = 'inactive')::int AS inactive,
+                    COUNT(*) FILTER (WHERE u.status::text = 'on_leave')::int AS on_leave,
+                    COUNT(*) FILTER (WHERE u.status::text = 'terminated')::int AS terminated,
+                    COUNT(*) FILTER (WHERE u.status IS NULL)::int AS no_status,
+                    COUNT(*) FILTER (WHERE u.status::text = 'active' AND LOWER(u.role::text) = 'user')::int AS active_employees,
+                    COUNT(*) FILTER (WHERE u.status::text = 'active' AND LOWER(u.role::text) = 'admin')::int AS active_admins,
+                    COUNT(*) FILTER (WHERE u.status::text = 'active' AND LOWER(u.role::text) = 'div_admin')::int AS active_div_admins,
+                    COUNT(*) FILTER (WHERE u.status::text = 'active' AND LOWER(u.role::text) = 'super_admin')::int AS active_super_admins,
+                    COUNT(DISTINCT LOWER(TRIM(u.unit))) FILTER (WHERE u.status::text = 'active' AND TRIM(COALESCE(u.unit, '')) <> '')::int AS units,
+                    COUNT(DISTINCT LOWER(TRIM(u.division))) FILTER (WHERE u.status::text = 'active' AND TRIM(COALESCE(u.division, '')) <> '')::int AS divisions
+                 FROM users u
+                 WHERE ${uWhere}`,
+                uParams
+            ),
+            // Admins can hold several departments ("A,B"), so split before counting.
+            pool.query(
+                `SELECT COUNT(DISTINCT LOWER(TRIM(d)))::int AS departments
+                 FROM users u, UNNEST(STRING_TO_ARRAY(u.department, ',')) AS d
+                 WHERE ${uWhere} AND u.status::text = 'active' AND TRIM(d) <> ''`,
+                uParams
+            ),
+            pool.query(
+                `SELECT COALESCE(NULLIF(TRIM(e.status), ''), 'Unknown') AS status, COUNT(*)::int AS count
+                 FROM equipment_master e ${eWhere}
+                 GROUP BY 1 ORDER BY 2 DESC`,
+                eParams
+            ),
+            pool.query(`SELECT COUNT(*)::int AS count FROM machine_parts p ${pWhere}`, pParams),
+            pool.query(
+                `SELECT COUNT(DISTINCT LOWER(TRIM(t.machine_name)))::int AS count
+                 FROM maintenance_tasks t ${mWhere}`,
+                mParams
+            ),
+            pool.query(
+                `SELECT COALESCE(NULLIF(TRIM(r.status), ''), 'Unknown') AS status, COUNT(*)::int AS count
+                 FROM repair_tasks r ${rWhere}
+                 GROUP BY 1 ORDER BY 2 DESC`,
+                rParams
+            ),
+            pool.query(
+                `SELECT COUNT(DISTINCT dd.task_id)::int AS tasks, COUNT(*)::int AS extensions
+                 FROM delegation_done dd JOIN delegation d ON d.task_id = dd.task_id ${dWhere}`,
+                dParams
+            ),
+            pool.query(`SELECT COUNT(*)::int AS count FROM working_date_history w ${wWhere}`, wParams),
+            getTaskSummary({ all_time: true }, profile)
+        ]);
+
+    const sumBy = (rows) => rows.reduce((n, r) => n + r.count, 0);
+
+    return {
+        success: true,
+        access_scope: describeScope(profile),
+        system_modules:
+            "Checklist (recurring tasks), Delegation (one-time tasks with extensions), Maintenance (machine maintenance tasks), " +
+            "Daily work reports, Equipment / machine register, Machine parts, Repair tasks. " +
+            "Also in the app but NOT readable by this assistant: leave, holidays, documents / subscriptions, asset management, WhatsApp settings.",
+        people: {
+            ...people.rows[0],
+            definitions:
+                "total_people counts user accounts that have a user name; active_employees = active users with role 'user'; " +
+                "admins / div_admins / super_admins are counted among active accounts only."
+        },
+        organisation: {
+            units: people.rows[0].units,
+            divisions: people.rows[0].divisions,
+            departments: departments.rows[0].departments
+        },
+        machines: {
+            equipment_registered: sumBy(equipment.rows),
+            equipment_by_status: equipment.rows,
+            machine_parts_registered: parts.rows[0].count,
+            machines_with_maintenance_tasks: maintMachines.rows[0].count,
+            repair_tasks_total: sumBy(repairs.rows),
+            repair_tasks_by_status: repairs.rows
+        },
+        tasks_all_time: {
+            date_range: `${tasks.filters?.start_date} to ${tasks.filters?.end_date}`,
+            overall: tasks.overall,
+            by_task_type: tasks.by_task_type
+        },
+        delegation_extensions_all_time: extended.rows[0],
+        work_reports_all_time: workReports.rows[0].count
+    };
+};
+
+
+// =====================================================================
+// TOOL 9: Active people with NO task assigned in a period
+// =====================================================================
+
+// Only real (non leave / inactive) tasks count as "assigned".
+const DOER_SOURCES = {
+    checklist: {
+        table: "checklist",
+        dateExpr: "task_start_date::date",
+        range: "task_start_date >= $1::date AND task_start_date < ($2::date + 1)"
+    },
+    delegation: {
+        table: "delegation",
+        dateExpr: "planned_date::date",
+        range: "planned_date >= $1::date AND planned_date < ($2::date + 1)"
+    },
+    maintenance: {
+        table: "maintenance_tasks",
+        dateExpr: "(task_start_date AT TIME ZONE 'UTC')::date",
+        range: "(task_start_date AT TIME ZONE 'UTC')::date BETWEEN $1::date AND $2::date"
+    }
+};
+
+export const listEmployeesWithoutTasks = async (args, profile, { maxLimit = MAX_LIST_LIMIT } = {}) => {
+    assertAdmin(profile);
+    const { startDate, endDate, allTime } = resolveDateRange(args, { maxDays: Infinity });
+    const taskType = pickEnum(args.task_type, TASK_TYPES, "all", "task_type");
+    const role = pickEnum(args.role, Object.keys(ROLE_FILTER_SQL), "user", "role");
+    const limit = clampLimit(args.limit, 50, maxLimit);
+
+    const dept = await resolveDepartment(args.department, profile);
+    if (dept.error) return { success: false, message: dept.error, candidates: dept.candidates };
+
+    const keys = taskType === "all" ? Object.keys(DOER_SOURCES) : [taskType];
+    const notLeave = "(status IS NULL OR LOWER(status::text) NOT IN ('leave', 'inactive'))";
+
+    const inRange = keys
+        .map((k) => `SELECT LOWER(TRIM(name)) AS n FROM ${DOER_SOURCES[k].table} WHERE ${DOER_SOURCES[k].range} AND ${notLeave}`)
+        .join("\n            UNION\n            ");
+    const lastAny = keys
+        .map((k) => `SELECT LOWER(TRIM(name)) AS n, MAX(${DOER_SOURCES[k].dateExpr}) AS d FROM ${DOER_SOURCES[k].table} WHERE ${notLeave} GROUP BY 1`)
+        .join("\n                UNION ALL\n                ");
+
+    const params = [startDate, endDate];
+    const where = [
+        "u.status::text = 'active'",
+        "TRIM(COALESCE(u.user_name, '')) <> ''",
+        ROLE_FILTER_SQL[role],
+        ...buildScope(profile, params, "u")
+    ];
+    if (dept.department) {
+        params.push(dept.department);
+        where.push(`LOWER(TRIM(u.department)) = LOWER(TRIM($${params.length}))`);
+    }
+
+    // MATERIALIZED: build each name set once, instead of re-scanning the task
+    // tables for every user (that is what made the all-time version time out).
+    const baseCte = `
+        WITH in_range AS MATERIALIZED (
+            ${inRange}
+        ),
+        last_any AS MATERIALIZED (
+            SELECT n, MAX(d) AS last_date FROM (
+                ${lastAny}
+            ) x GROUP BY n
+        ),
+        base AS (
+            SELECT u.user_name, u.employee_id, u.department, u.designation,
+                   LOWER(u.role::text) AS role, l.last_date,
+                   EXISTS (SELECT 1 FROM in_range r WHERE r.n = LOWER(TRIM(u.user_name))) AS has_tasks
+            FROM users u
+            LEFT JOIN last_any l ON l.n = LOWER(TRIM(u.user_name))
+            WHERE ${where.join(" AND ")}
+        )`;
+
+    const [byDept, list] = await Promise.all([
+        pool.query(
+            `${baseCte}
+            SELECT COALESCE(NULLIF(TRIM(department), ''), '(no department)') AS department,
+                   COUNT(*)::int AS active_people,
+                   COUNT(*) FILTER (WHERE NOT has_tasks)::int AS without_tasks
+            FROM base
+            GROUP BY 1
+            ORDER BY without_tasks DESC, department`,
+            params
+        ),
+        pool.query(
+            `${baseCte}
+            SELECT TRIM(user_name) AS employee, employee_id, department, designation, role,
+                   COALESCE(to_char(last_date, 'YYYY-MM-DD'), 'never') AS last_task_date
+            FROM base
+            WHERE NOT has_tasks
+            ORDER BY last_date NULLS FIRST, department, user_name
+            LIMIT $${params.length + 1}`,
+            [...params, limit]
+        )
+    ]);
+
+    const activePeople = byDept.rows.reduce((n, r) => n + r.active_people, 0);
+    const withoutTasks = byDept.rows.reduce((n, r) => n + r.without_tasks, 0);
+
+    return {
+        success: true,
+        filters: {
+            ...(allTime ? { all_time: true } : {}),
+            start_date: startDate,
+            end_date: endDate,
+            task_type: taskType,
+            role,
+            department: dept.department || "all"
+        },
+        access_scope: describeScope(profile),
+        definitions:
+            "without_tasks = active people with no checklist / delegation / maintenance task (excluding leave rows) dated in the range. " +
+            "last_task_date = their latest task date ever ('never' = no task at all). role 'user' = regular employees (admins usually assign tasks).",
+        active_people: activePeople,
+        without_tasks: withoutTasks,
+        with_tasks: activePeople - withoutTasks,
+        by_department: byDept.rows.filter((r) => r.without_tasks > 0),
+        showing: list.rows.length,
+        people: list.rows.map(compactRow)
+    };
+};
+
+
+// =====================================================================
+// TOOL 10: Department-wise performance (where to improve)
+// =====================================================================
+
+const DEPT_SORT = ["on_time_rate", "completion_rate", "overdue", "pending", "late", "not_done", "total"];
+
+export const getDepartmentWiseSummary = async (args, profile) => {
+    assertAdmin(profile);
+    const { filters, failure } = await readCommonFilters(
+        { ...args, employee_name: null, department: null },
+        profile,
+        { maxDays: Infinity }
+    );
+    if (failure) return failure;
+
+    const sortBy = pickEnum(args.sort_by, DEPT_SORT, "on_time_rate", "sort_by");
+    const order = pickEnum(args.order, ["worst_first", "best_first"], "worst_first", "order");
+    const minTasks = clampLimit(args.min_tasks, 5, 1000000);
+
+    const { cte, params, add } = buildTasksCte(profile, filters);
+    const todayP = add(filters.today);
+
+    const { rows } = await pool.query(
+        `${cte}
+        SELECT MAX(TRIM(department)) AS department,
+               COUNT(DISTINCT LOWER(employee))::int AS employees,
+               ${countColumns(todayP)}
+        FROM tasks
+        WHERE TRIM(COALESCE(department, '')) <> ''
+        GROUP BY LOWER(TRIM(department))`,
+        params
+    );
+
+    const all = rows.map(withRate);
+    const considered = all.filter((r) => r.total >= minTasks);
+
+    return {
+        success: true,
+        filters: describeFilters(filters),
+        access_scope: describeScope(profile),
+        sorted_by: sortBy,
+        order,
+        min_tasks: minTasks,
+        definitions:
+            "Rates: completion_rate_percent = completed / total; on_time_rate_percent = on_time / completed. " +
+            "Departments with fewer than min_tasks tasks are left out of the ranking (too few to judge). " +
+            "Compare each department with 'overall' to say where improvement is needed.",
+        overall: sumCounts(all),
+        departments_ranked: sortRows(considered, sortBy, order).slice(0, 100),
+        departments_left_out_small: all.length - considered.length
+    };
+};
+
+
+// =====================================================================
+// TOOL 11: Machines (equipment register, maintenance per machine, repairs)
+// =====================================================================
+
+const MACHINE_SORT = ["overdue", "pending", "late", "total", "on_time_rate", "completion_rate", "repairs"];
+
+export const getMachineSummary = async (args, profile, { maxLimit = MAX_LIST_LIMIT } = {}) => {
+    assertAdmin(profile);
+    const { startDate, endDate, today, allTime } = resolveDateRange(args, { maxDays: Infinity });
+    const machine = cleanText(args.machine_name);
+    const department = cleanText(args.department);
+    const sortBy = pickEnum(args.sort_by, MACHINE_SORT, "overdue", "sort_by");
+    const order = pickEnum(args.order, ["worst_first", "best_first"], "worst_first", "order");
+    const limit = clampLimit(args.limit, 15, maxLimit);
+
+    // --- Equipment register + parts (not date based) ---
+    const eParams = [];
+    const eClauses = buildMachineScope(profile, eParams, "e");
+    if (machine) {
+        eParams.push(`%${escapeLike(machine)}%`);
+        eClauses.push(`e.equipment_name ILIKE $${eParams.length}`);
+    }
+    if (department) {
+        eParams.push(department);
+        eClauses.push(`LOWER(TRIM(e.machine_department)) = LOWER(TRIM($${eParams.length}))`);
+    }
+
+    const pParams = [];
+    const pClauses = buildMachineScope(profile, pParams, "p");
+    if (machine) {
+        pParams.push(`%${escapeLike(machine)}%`);
+        pClauses.push(`p.machine_name ILIKE $${pParams.length}`);
+    }
+    if (department) {
+        pParams.push(department);
+        pClauses.push(`LOWER(TRIM(p.machine_department)) = LOWER(TRIM($${pParams.length}))`);
+    }
+
+    // --- Maintenance tasks per machine in the range (dates are UTC dates, like the dashboard) ---
+    const mParams = [startDate, endDate, today];
+    const mClauses = [
+        "(t.status IS NULL OR LOWER(t.status::text) NOT IN ('leave', 'inactive'))",
+        "(t.task_start_date AT TIME ZONE 'UTC')::date BETWEEN $1::date AND $2::date",
+        "TRIM(COALESCE(t.machine_name, '')) <> ''",
+        ...buildScope(profile, mParams, "t")
+    ];
+    if (machine) {
+        mParams.push(`%${escapeLike(machine)}%`);
+        mClauses.push(`t.machine_name ILIKE $${mParams.length}`);
+    }
+    if (department) {
+        mParams.push(department);
+        mClauses.push(`LOWER(TRIM(t.machine_department)) = LOWER(TRIM($${mParams.length}))`);
+    }
+    const onTime =
+        "t.submission_date IS NOT NULL AND t.planned_date IS NOT NULL " +
+        "AND (t.submission_date AT TIME ZONE 'UTC')::date <= (t.planned_date AT TIME ZONE 'UTC')::date";
+
+    // --- Repairs per machine in the range (by created date, IST) ---
+    const rParams = [startDate, endDate];
+    const rClauses = [
+        "(r.created_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $1::date AND $2::date",
+        ...buildMachineScope(profile, rParams, "r")
+    ];
+    if (machine) {
+        rParams.push(`%${escapeLike(machine)}%`);
+        rClauses.push(`r.machine_name ILIKE $${rParams.length}`);
+    }
+    if (department) {
+        rParams.push(department);
+        rClauses.push(`LOWER(TRIM(r.machine_department)) = LOWER(TRIM($${rParams.length}))`);
+    }
+
+    const [eqStatus, eqByDept, parts, maint, repairs] = await Promise.all([
+        pool.query(
+            `SELECT COALESCE(NULLIF(TRIM(e.status), ''), 'Unknown') AS status, COUNT(*)::int AS count
+             FROM equipment_master e ${whereSql(eClauses)}
+             GROUP BY 1 ORDER BY 2 DESC`,
+            eParams
+        ),
+        pool.query(
+            `SELECT TRIM(e.machine_division) AS division, TRIM(e.machine_department) AS department, COUNT(*)::int AS machines
+             FROM equipment_master e ${whereSql(eClauses)}
+             GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 30`,
+            eParams
+        ),
+        pool.query(`SELECT COUNT(*)::int AS count FROM machine_parts p ${whereSql(pClauses)}`, pParams),
+        pool.query(
+            `SELECT
+                MAX(TRIM(t.machine_name)) AS machine,
+                MAX(TRIM(t.machine_department)) AS machine_department,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE t.submission_date IS NOT NULL)::int AS completed,
+                COUNT(*) FILTER (WHERE t.submission_date IS NULL)::int AS pending,
+                COUNT(*) FILTER (WHERE t.submission_date IS NULL AND (t.task_start_date AT TIME ZONE 'UTC')::date < $3::date)::int AS overdue,
+                COUNT(*) FILTER (WHERE ${onTime})::int AS on_time,
+                COUNT(*) FILTER (WHERE t.submission_date IS NOT NULL AND NOT COALESCE(${onTime}, FALSE))::int AS late,
+                to_char(MAX(t.submission_date AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS last_maintenance_done
+             FROM maintenance_tasks t
+             WHERE ${mClauses.join(" AND ")}
+             GROUP BY LOWER(TRIM(t.machine_name))`,
+            mParams
+        ),
+        pool.query(
+            `SELECT LOWER(TRIM(COALESCE(r.machine_name, ''))) AS k,
+                    MAX(TRIM(r.machine_name)) AS machine,
+                    COALESCE(NULLIF(TRIM(r.status), ''), 'Unknown') AS status,
+                    COUNT(*)::int AS count
+             FROM repair_tasks r
+             WHERE ${rClauses.join(" AND ")}
+             GROUP BY 1, 3`,
+            rParams
+        )
+    ]);
+
+    // Repairs per machine (all statuses) to attach to the maintenance rows.
+    const repairByMachine = new Map();
+    const repairByStatus = new Map();
+    for (const r of repairs.rows) {
+        repairByMachine.set(r.k, (repairByMachine.get(r.k) || 0) + r.count);
+        repairByStatus.set(r.status, (repairByStatus.get(r.status) || 0) + r.count);
+    }
+
+    const machines = maint.rows.map((m) => ({
+        ...withRate(m),
+        repairs: repairByMachine.get(String(m.machine || "").toLowerCase()) || 0
+    }));
+
+    return {
+        success: true,
+        filters: {
+            ...(allTime ? { all_time: true } : {}),
+            start_date: startDate,
+            end_date: endDate,
+            machine: machine || "all",
+            department: department || "all",
+            sorted_by: sortBy,
+            order
+        },
+        access_scope: describeScope(profile),
+        definitions:
+            "equipment_* = machine register (not date based). maintenance_* = maintenance tasks dated in the range, per machine; " +
+            "on_time = submitted on or before the planned date. repairs = repair tasks created in the range.",
+        equipment_registered: eqStatus.rows.reduce((n, r) => n + r.count, 0),
+        equipment_by_status: eqStatus.rows,
+        equipment_by_department: eqByDept.rows,
+        machine_parts_registered: parts.rows[0].count,
+        maintenance_overall: sumCounts(maint.rows),
+        machines_with_maintenance: machines.length,
+        machines_ranked: sortRows(machines, sortBy, order).slice(0, limit).map(compactRow),
+        repairs_total: repairs.rows.reduce((n, r) => n + r.count, 0),
+        repairs_by_status: [...repairByStatus].map(([status, count]) => ({ status, count }))
     };
 };

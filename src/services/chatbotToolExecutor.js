@@ -204,7 +204,11 @@ import {
     findEmployees,
     listDepartments,
     listExtendedDelegations,
-    getWorkReports
+    getWorkReports,
+    getSystemOverview,
+    listEmployeesWithoutTasks,
+    getDepartmentWiseSummary,
+    getMachineSummary
 } from "./chatbotDataService.js";
 
 const ADMIN_TOOL_HANDLERS = {
@@ -214,7 +218,11 @@ const ADMIN_TOOL_HANDLERS = {
     find_employees: findEmployees,
     list_departments: listDepartments,
     list_extended_delegations: listExtendedDelegations,
-    get_work_reports: getWorkReports
+    get_work_reports: getWorkReports,
+    get_system_overview: getSystemOverview,
+    list_employees_without_tasks: listEmployeesWithoutTasks,
+    get_department_wise_summary: getDepartmentWiseSummary,
+    get_machine_summary: getMachineSummary
 };
 
 export const executeAdminTool = async (toolName, args, profile) => {
