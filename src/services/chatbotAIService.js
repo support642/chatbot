@@ -111,7 +111,7 @@ const HINGLISH_WORDS = new Set([
     "bata", "dena", "dedo", "karo", "kro", "kar", "krna", "karna", "wala",
     "wale", "wali", "mujhe", "muje", "hum", "tum", "aap", "apna", "apne", "uska",
     "uske", "iska", "iske", "abhi", "kuch", "koi", "chahiye", "chaiye", "hua", "hue",
-    "hui", "gaya", "gaye", "raha", "rahe", "rha", "rhe", "pura", "poora", "sirf",
+    "hui", "gaya", "gaye", "raha", "rahe", "rha", "rhe", "pura", "poora", "puri", "poori", "sirf",
     "bhai", "acha", "accha", "theek", "thik", "haan", "ji", "kripya", "samjhao"
 ]);
 
@@ -266,7 +266,9 @@ Rules:
      list_employees_without_tasks (say which period you checked; if the user
      says "kabhi nahi / ever", use all_time = true)
    - Department performance, best / worst department -> get_department_wise_summary
-   - Machines, machine maintenance, repairs -> get_machine_summary
+   - Machines overall (how many, which machines have most overdue / late) -> get_machine_summary
+   - ONE machine / part / part area in detail (model, serial no, parts list,
+     part-wise maintenance, who does it, repair history) -> get_machine_details
    - Unsure of a person's or department's exact name -> find_employees / list_departments
    "Who is doing the best work / sabse achha kaam": use get_employee_wise_summary
    sorted by on_time and completion_rate, and mention their totals so a person with

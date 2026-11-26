@@ -435,6 +435,52 @@ export const adminTools = [
                 additionalProperties: false
             }
         }
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_machine_details",
+            description:
+                "Full details for ONE machine, part, part area, machine department or division: equipment register info (equipment ID, model, serial no, purchase / installation date, running hours, status), registered parts list, PART-WISE maintenance status (total, pending, overdue, on time, late, last done), recent maintenance tasks (parts, area, doer, assigned by, description, frequency, status, duration, manpower, remarks, approval) and repair history (issue, part replaced, vendor, bill amount, status). Use for 'STG machine ki detail', 'STG ke kaun se parts hain', 'turbine area ke pending maintenance', 'generator part ka status', 'is machine ki repair history'.",
+            parameters: {
+                type: "object",
+                properties: {
+                    machine_name: {
+                        type: "string",
+                        description: "Machine name or equipment ID (full or partial), e.g. 'STG'."
+                    },
+                    part_name: {
+                        type: "string",
+                        description: "Part name (full or partial), e.g. 'TURBINE'."
+                    },
+                    part_area: {
+                        type: "string",
+                        description: "Part / machine area (full or partial), e.g. 'TURBINE AREA'."
+                    },
+                    department: {
+                        type: "string",
+                        description: "Machine department, e.g. 'Electrical'."
+                    },
+                    division: {
+                        type: "string",
+                        description: "Machine division, e.g. 'CPP'."
+                    },
+                    ...dateRangeProps,
+                    ...allTimeProp,
+                    task_status: {
+                        type: "string",
+                        enum: ["all", "pending", "overdue", "completed", "on_time", "late"],
+                        description: "Filter for the maintenance task list. Default 'all'."
+                    },
+                    limit: {
+                        type: "integer",
+                        description: "Maintenance tasks to list (1-50). Default 10."
+                    }
+                },
+                required: [],
+                additionalProperties: false
+            }
+        }
     }
 ];
 

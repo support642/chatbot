@@ -208,7 +208,8 @@ import {
     getSystemOverview,
     listEmployeesWithoutTasks,
     getDepartmentWiseSummary,
-    getMachineSummary
+    getMachineSummary,
+    getMachineDetails
 } from "./chatbotDataService.js";
 
 const ADMIN_TOOL_HANDLERS = {
@@ -222,7 +223,8 @@ const ADMIN_TOOL_HANDLERS = {
     get_system_overview: getSystemOverview,
     list_employees_without_tasks: listEmployeesWithoutTasks,
     get_department_wise_summary: getDepartmentWiseSummary,
-    get_machine_summary: getMachineSummary
+    get_machine_summary: getMachineSummary,
+    get_machine_details: getMachineDetails
 };
 
 export const executeAdminTool = async (toolName, args, profile) => {

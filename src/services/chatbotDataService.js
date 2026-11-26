@@ -170,6 +170,8 @@ const TASK_BRANCHES = [
             submittedBy: "t.submitted_by",
             approvedBy: "t.approved_by",
             machine: "t.machine_name",
+            partName: "ARRAY_TO_STRING(t.part_name, ', ')",
+            partArea: "t.part_area",
             extendCount: "NULL"
         }
     }
@@ -540,6 +542,8 @@ const buildTasksCte = (profile, filters) => {
             (${c.submittedBy})::text AS submitted_by,
             (${c.approvedBy})::text AS approved_by,
             (${c.machine})::text AS machine_name,
+            (${c.partName || "NULL"})::text AS part_name,
+            (${c.partArea || "NULL"})::text AS part_area,
             (${c.extendCount})::int AS extend_count
         FROM ${b.from}
         WHERE ${where}`;
@@ -764,6 +768,8 @@ export const listTasks = async (args, profile, { maxLimit = MAX_LIST_LIMIT } = {
             NULLIF(delay, '00:00:00') AS delay,
             NULLIF(extend_count, 0) AS times_extended,
             remarks, approval, submitted_by, approved_by, machine_name,
+            LEFT(part_name, 200) AS part_name,
+            part_area,
             COUNT(*) OVER ()::int AS total_matching
         FROM tasks
         WHERE ${statusSql}
@@ -1632,5 +1638,236 @@ export const getMachineSummary = async (args, profile, { maxLimit = MAX_LIST_LIM
         machines_ranked: sortRows(machines, sortBy, order).slice(0, limit).map(compactRow),
         repairs_total: repairs.rows.reduce((n, r) => n + r.count, 0),
         repairs_by_status: [...repairByStatus].map(([status, count]) => ({ status, count }))
+    };
+};
+
+
+// =====================================================================
+// TOOL 12: Machine details (register info, parts, part-wise maintenance,
+//          recent maintenance tasks, repair history)
+// =====================================================================
+
+const TASK_STATUS_FILTERS = ["all", "pending", "overdue", "completed", "on_time", "late"];
+
+export const getMachineDetails = async (args, profile, { maxLimit = MAX_LIST_LIMIT } = {}) => {
+    assertAdmin(profile);
+    const { startDate, endDate, today, allTime } = resolveDateRange(args, { maxDays: Infinity });
+    const machine = cleanText(args.machine_name);
+    const part = cleanText(args.part_name);
+    const area = cleanText(args.part_area);
+    const department = cleanText(args.department);
+    const division = cleanText(args.division);
+    const taskStatus = pickEnum(args.task_status, TASK_STATUS_FILTERS, "all", "task_status");
+    const taskLimit = clampLimit(args.limit, 10, maxLimit);
+
+    if (!machine && !part && !area && !department && !division) {
+        throw new Error(
+            "Provide a machine_name, part_name, part_area, department or division. " +
+            "For overall machine counts use get_machine_summary."
+        );
+    }
+
+    const like = (v) => `%${escapeLike(v)}%`;
+
+    // ---- Equipment register (equipment_master) ----
+    const eParams = [];
+    const eClauses = buildMachineScope(profile, eParams, "e");
+    if (machine) { eParams.push(like(machine)); eClauses.push(`(e.equipment_name ILIKE $${eParams.length} OR e.equipment_id ILIKE $${eParams.length})`); }
+    if (area) { eParams.push(like(area)); eClauses.push(`e.machine_area ILIKE $${eParams.length}`); }
+    if (part) {
+        // Machines whose registered parts include this part.
+        eParams.push(like(part));
+        eClauses.push(`EXISTS (
+            SELECT 1 FROM machine_parts p2, UNNEST(p2.part_name) x
+            WHERE (p2.equipment_id = e.equipment_id OR LOWER(TRIM(p2.machine_name)) = LOWER(TRIM(e.equipment_name)))
+              AND x ILIKE $${eParams.length})`);
+    }
+    if (department) { eParams.push(department); eClauses.push(`LOWER(TRIM(e.machine_department)) = LOWER(TRIM($${eParams.length}))`); }
+    if (division) { eParams.push(division); eClauses.push(`LOWER(TRIM(e.machine_division)) = LOWER(TRIM($${eParams.length}))`); }
+
+    // ---- Registered parts (machine_parts: one row per machine + area, part_name[]) ----
+    const pParams = [];
+    const pClauses = buildMachineScope(profile, pParams, "p");
+    if (machine) { pParams.push(like(machine)); pClauses.push(`(p.machine_name ILIKE $${pParams.length} OR p.equipment_id ILIKE $${pParams.length})`); }
+    if (area) { pParams.push(like(area)); pClauses.push(`p.machine_area ILIKE $${pParams.length}`); }
+    if (part) { pParams.push(like(part)); pClauses.push(`EXISTS (SELECT 1 FROM UNNEST(p.part_name) x WHERE x ILIKE $${pParams.length})`); }
+    if (department) { pParams.push(department); pClauses.push(`LOWER(TRIM(p.machine_department)) = LOWER(TRIM($${pParams.length}))`); }
+    if (division) { pParams.push(division); pClauses.push(`LOWER(TRIM(p.machine_division)) = LOWER(TRIM($${pParams.length}))`); }
+
+    // ---- Maintenance tasks in the range (UTC dates, like the dashboard) ----
+    const mParams = [startDate, endDate, today];
+    const mClauses = [
+        "(t.status IS NULL OR LOWER(t.status::text) NOT IN ('leave', 'inactive'))",
+        "(t.task_start_date AT TIME ZONE 'UTC')::date BETWEEN $1::date AND $2::date",
+        ...buildScope(profile, mParams, "t")
+    ];
+    if (machine) { mParams.push(like(machine)); mClauses.push(`t.machine_name ILIKE $${mParams.length}`); }
+    if (area) { mParams.push(like(area)); mClauses.push(`t.part_area ILIKE $${mParams.length}`); }
+    if (part) { mParams.push(like(part)); mClauses.push(`EXISTS (SELECT 1 FROM UNNEST(t.part_name) x WHERE x ILIKE $${mParams.length})`); }
+    if (department) { mParams.push(department); mClauses.push(`LOWER(TRIM(t.machine_department)) = LOWER(TRIM($${mParams.length}))`); }
+    if (division) { mParams.push(division); mClauses.push(`LOWER(TRIM(t.machine_division)) = LOWER(TRIM($${mParams.length}))`); }
+
+    const onTime =
+        "t.submission_date IS NOT NULL AND t.planned_date IS NOT NULL " +
+        "AND (t.submission_date AT TIME ZONE 'UTC')::date <= (t.planned_date AT TIME ZONE 'UTC')::date";
+    const overdue = "t.submission_date IS NULL AND (t.task_start_date AT TIME ZONE 'UTC')::date < $3::date";
+    const statusSql = {
+        all: "TRUE",
+        pending: "t.submission_date IS NULL",
+        overdue,
+        completed: "t.submission_date IS NOT NULL",
+        on_time: onTime,
+        late: `t.submission_date IS NOT NULL AND NOT COALESCE(${onTime}, FALSE)`
+    }[taskStatus];
+    const mWhere = mClauses.join(" AND ");
+
+    // ---- Repair history (all time, latest first) ----
+    const rParams = [];
+    const rClauses = buildMachineScope(profile, rParams, "r");
+    if (machine) { rParams.push(like(machine)); rClauses.push(`(r.machine_name ILIKE $${rParams.length} OR r.equipment_id ILIKE $${rParams.length})`); }
+    if (part) { rParams.push(like(part)); rClauses.push(`r.part_replaced ILIKE $${rParams.length}`); }
+    if (area) {
+        // Repairs on machines located in this area (repair_tasks has no area column).
+        rParams.push(like(area));
+        rClauses.push(`EXISTS (
+            SELECT 1 FROM machine_parts p2
+            WHERE p2.machine_area ILIKE $${rParams.length}
+              AND (p2.equipment_id = r.equipment_id OR LOWER(TRIM(p2.machine_name)) = LOWER(TRIM(r.machine_name)))
+            UNION ALL
+            SELECT 1 FROM equipment_master e2
+            WHERE e2.machine_area ILIKE $${rParams.length}
+              AND (e2.equipment_id = r.equipment_id OR LOWER(TRIM(e2.equipment_name)) = LOWER(TRIM(r.machine_name))))`);
+    }
+    if (department) { rParams.push(department); rClauses.push(`LOWER(TRIM(r.machine_department)) = LOWER(TRIM($${rParams.length}))`); }
+    if (division) { rParams.push(division); rClauses.push(`LOWER(TRIM(r.machine_division)) = LOWER(TRIM($${rParams.length}))`); }
+
+    const [equipment, parts, partStats, tasks, repairs] = await Promise.all([
+        pool.query(
+            `SELECT e.equipment_id, e.equipment_name, e.model, e.serial_no,
+                    e.machine_division AS division, e.machine_department AS department, e.machine_area AS area,
+                    to_char(e.purchase_date, 'YYYY-MM-DD') AS purchase_date,
+                    to_char(e.installation_date, 'YYYY-MM-DD') AS installation_date,
+                    e.running_hours, e.status, e.remarks,
+                    COUNT(*) OVER ()::int AS total_matching
+             FROM equipment_master e ${whereSql(eClauses)}
+             ORDER BY e.equipment_name
+             LIMIT 20`,
+            eParams
+        ),
+        pool.query(
+            `SELECT p.machine_name, p.machine_area AS area, p.machine_department AS department,
+                    p.machine_division AS division, p.equipment_id,
+                    COALESCE(CARDINALITY(p.part_name), 0)::int AS part_count,
+                    LEFT(ARRAY_TO_STRING(p.part_name, ', '), 400) AS parts,
+                    COUNT(*) OVER ()::int AS total_matching,
+                    SUM(COALESCE(CARDINALITY(p.part_name), 0)) OVER ()::int AS total_parts
+             FROM machine_parts p ${whereSql(pClauses)}
+             ORDER BY p.machine_name, p.machine_area
+             LIMIT 20`,
+            pParams
+        ),
+        // Part-wise: a task covering several parts counts once for each part.
+        pool.query(
+            `SELECT MAX(TRIM(x)) AS part,
+                    MAX(TRIM(t.machine_name)) AS machine,
+                    MAX(TRIM(t.part_area)) AS area,
+                    COUNT(*)::int AS total,
+                    COUNT(*) FILTER (WHERE t.submission_date IS NOT NULL)::int AS completed,
+                    COUNT(*) FILTER (WHERE t.submission_date IS NULL)::int AS pending,
+                    COUNT(*) FILTER (WHERE ${overdue})::int AS overdue,
+                    COUNT(*) FILTER (WHERE ${onTime})::int AS on_time,
+                    COUNT(*) FILTER (WHERE t.submission_date IS NOT NULL AND NOT COALESCE(${onTime}, FALSE))::int AS late,
+                    to_char(MAX(t.submission_date AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS last_done
+             FROM maintenance_tasks t, UNNEST(t.part_name) AS x
+             WHERE ${mWhere} AND TRIM(COALESCE(x, '')) <> ''
+             GROUP BY LOWER(TRIM(x))
+             ORDER BY overdue DESC, pending DESC, total DESC
+             LIMIT 30`,
+            mParams
+        ),
+        pool.query(
+            `SELECT t.id::text AS task_id,
+                    TRIM(t.machine_name) AS machine,
+                    LEFT(ARRAY_TO_STRING(t.part_name, ', '), 150) AS parts,
+                    t.part_area AS area,
+                    TRIM(t.name) AS doer,
+                    t.given_by AS assigned_by,
+                    LEFT(t.task_description, 200) AS task_description,
+                    t.frequency,
+                    to_char((t.task_start_date AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS task_date,
+                    to_char(t.submission_date AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD HH24:MI') AS submitted_at,
+                    CASE
+                        WHEN t.submission_date IS NOT NULL THEN
+                            CASE WHEN ${onTime} THEN 'completed_on_time' ELSE 'completed_late' END
+                        WHEN ${overdue} THEN 'overdue'
+                        WHEN (t.task_start_date AT TIME ZONE 'UTC')::date = $3::date THEN 'due_today'
+                        ELSE 'upcoming'
+                    END AS current_status,
+                    t.duration, t.manpower, t.remarks, t.admin_done AS approval,
+                    COUNT(*) OVER ()::int AS total_matching,
+                    COUNT(*) FILTER (WHERE t.submission_date IS NULL) OVER ()::int AS pending_total,
+                    COUNT(*) FILTER (WHERE ${overdue}) OVER ()::int AS overdue_total
+             FROM maintenance_tasks t
+             WHERE ${mWhere} AND ${statusSql}
+             ORDER BY (t.submission_date IS NULL) DESC, t.task_start_date DESC
+             LIMIT $${mParams.length + 1}`,
+            [...mParams, taskLimit]
+        ),
+        pool.query(
+            `SELECT to_char(r.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS reported_on,
+                    r.machine_name AS machine, r.equipment_id, r.issue_description AS issue,
+                    r.part_replaced, r.status, r.assigned_person, r.filled_by AS reported_by,
+                    r.vendor_name AS vendor, r.bill_amount, r.duration,
+                    to_char(r.submission_date AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS completed_on,
+                    r.admin_approved_by AS approved_by,
+                    COUNT(*) OVER ()::int AS total_matching
+             FROM repair_tasks r ${whereSql(rClauses)}
+             ORDER BY r.created_at DESC
+             LIMIT 10`,
+            rParams
+        )
+    ]);
+
+    const total = (res) => res.rows[0]?.total_matching || 0;
+    const strip = (rows, keys) => rows.map((r) => {
+        const copy = { ...r };
+        for (const k of keys) delete copy[k];
+        return compactRow(copy);
+    });
+    const firstTask = tasks.rows[0] || {};
+
+    return {
+        success: true,
+        filters: {
+            ...(allTime ? { all_time: true } : {}),
+            start_date: startDate,
+            end_date: endDate,
+            machine: machine || "any",
+            part: part || "any",
+            part_area: area || "any",
+            department: department || "any",
+            division: division || "any",
+            task_status: taskStatus
+        },
+        access_scope: describeScope(profile),
+        definitions:
+            "equipment = machine register (model, serial no, dates, running hours). registered_parts = parts list per machine + area. " +
+            "part_wise_maintenance and maintenance_tasks cover tasks dated in the range; a task covering several parts counts once per part " +
+            "in part_wise_maintenance. repair_history is all time (latest 10).",
+        equipment: { total_matching: total(equipment), rows: strip(equipment.rows, ["total_matching"]) },
+        registered_parts: {
+            machine_area_rows: total(parts),
+            total_parts: parts.rows[0]?.total_parts || 0,
+            rows: strip(parts.rows, ["total_matching", "total_parts"])
+        },
+        part_wise_maintenance: partStats.rows.map(compactRow),
+        maintenance_tasks: {
+            total_matching: firstTask.total_matching || 0,
+            pending: firstTask.pending_total || 0,
+            overdue: firstTask.overdue_total || 0,
+            showing: tasks.rows.length,
+            rows: strip(tasks.rows, ["total_matching", "pending_total", "overdue_total"])
+        },
+        repair_history: { total: total(repairs), rows: strip(repairs.rows, ["total_matching"]) }
     };
 };
